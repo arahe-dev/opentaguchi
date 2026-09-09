@@ -1,0 +1,6 @@
+github.com/arahe-dev/emanator v0.1.0 h1:5Ohd5MJgoMrUu2H3DIl788uJ7uuQVbpS9rlfHIZ4T2g=
+github.com/arahe-dev/emanator v0.1.0/go.mod h1:E5t+vrH8cpGPfs1GJ1S79/jnge8olOmmlXgsBYWh77Y=
+github.com/arahe-dev/hertasdk v0.2.0 h1:qLQ0p8BiGI9B/OxOhFr+TweyVZukTLEAzXNsY/dMubM=
+github.com/arahe-dev/hertasdk v0.2.0/go.mod h1:voY66DmBb6aihlGTbNX6dJ+syrShZmUNSlq8G8J94y8=
+golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
+golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
