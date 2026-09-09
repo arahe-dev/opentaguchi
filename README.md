@@ -32,3 +32,10 @@ report, err := opentaguchi.RunStudy(ctx, spec, executor, opentaguchi.RunOptions{
 
 An `emanator.CoordinatorClient` directly implements `WorkflowExecutor`.
 `opentaguchi.CoordinatorExecutor` adapts an in-process coordinator.
+
+## Cross-domain proof
+
+`cmd/su2-study` runs the same frozen core against a real SU2 NACA0012 Euler
+case: nine L9 CFD workflows on three Emanator workers, maximizing lift-to-drag
+subject to a lift constraint. See [`examples/su2`](examples/su2) for the
+official solver download and run instructions.
