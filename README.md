@@ -11,7 +11,10 @@ constraint metrics, and returns a ranked report.
 `cmd/arm-study` runs a four-variable, three-level Taguchi L9 for the existing
 CadQuery → Gmsh → CalculiX arm chain: nine candidates and 27 distributed jobs.
 It minimizes `mass_kg`, subject to factor of safety ≥ 2.5 and displacement ≤
-0.01 mm by default. Start an Emanator coordinator and workers, then run:
+1.5 mm by default. This is a physically meaningful demo threshold for the
+current roughly 200 mm, 1 kN cantilever example; provide
+`-max-displacement-mm` when a different design limit is appropriate. Start an
+Emanator coordinator and workers, then run:
 
 ```text
 go run ./cmd/arm-study -coordinator-url http://coordinator:8080

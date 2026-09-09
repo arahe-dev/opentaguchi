@@ -12,11 +12,13 @@ import (
 	"github.com/arahe-dev/opentaguchi"
 )
 
+const defaultDisplacementLimitMM = 1.5
+
 func main() {
 	coordinatorURL := flag.String("coordinator-url", "http://127.0.0.1:8080", "remote Emanator coordinator URL")
 	timeout := flag.Duration("timeout", 30*time.Minute, "overall study timeout")
 	maxConcurrent := flag.Int("max-concurrent", 0, "maximum candidate workflows in flight; zero means all nine")
-	displacementLimit := flag.Float64("max-displacement-mm", 0.01, "maximum allowable displacement")
+	displacementLimit := flag.Float64("max-displacement-mm", defaultDisplacementLimitMM, "maximum allowable displacement")
 	flag.Parse()
 
 	executor, err := emanator.NewCoordinatorClient(*coordinatorURL)
