@@ -54,4 +54,10 @@ go run ./cmd/arm-adaptive-study -coordinator-url http://127.0.0.1:8080
 
 The public `Policy` boundary also includes `TaguchiL9Policy`,
 `TaguchiL27Policy`, and `FullFactorialPolicy`; these are one-shot policies that
-propose their complete design once.
+propose their complete design once. Taguchi refinement proposals are atomic:
+`CandidatesPerRound` never truncates an L9 or L27; use `MaxConcurrent` to bound
+workflow execution instead.
+
+`StudyState` contains the completed round history needed to reconstruct the
+next proposal. Persist it and pass it back through
+`AdaptiveRunOptions.InitialState` to resume with a newly constructed policy.

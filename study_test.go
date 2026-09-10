@@ -83,15 +83,17 @@ func TestRunStudyRanksFeasibleCandidates(t *testing.T) {
 func TestTaguchiPoliciesProposeFixedDesigns(t *testing.T) {
 	variables := []Variable{{Name: "x", Levels: []float64{1, 2, 3}}, {Name: "y", Levels: []float64{4, 5, 6}}}
 	policy := NewTaguchiL9Policy(variables)
-	candidates, err := policy.Propose(context.Background(), StudyState{}, 0)
+	candidates, err := policy.Propose(context.Background(), StudyState{}, 4)
 	if err != nil || len(candidates) != 9 {
 		t.Fatalf("candidates=%d err=%v", len(candidates), err)
 	}
-	if err := policy.Observe(context.Background(), nil); err != nil {
-		t.Fatal(err)
+	if policy.Done(StudyState{}) || !policy.Done(StudyState{Round: 1}) || candidates[0].ID != "candidate-01" {
+		t.Fatalf("unexpected fixed policy state: done-at-zero=%t done-at-one=%t first=%q", policy.Done(StudyState{}), policy.Done(StudyState{Round: 1}), candidates[0].ID)
 	}
-	if !policy.Done(StudyState{}) || candidates[0].ID != "candidate-01" {
-		t.Fatalf("unexpected fixed policy state: done=%t first=%q", policy.Done(StudyState{}), candidates[0].ID)
+	l27Policy := NewTaguchiL27Policy(variables)
+	l27, err := l27Policy.Propose(context.Background(), StudyState{}, 4)
+	if err != nil || len(l27) != 27 {
+		t.Fatalf("atomic L27 candidates=%d err=%v", len(l27), err)
 	}
 }
 
@@ -147,7 +149,7 @@ func TestRunAdaptiveStudyRecentersSecondL9(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := RunAdaptiveStudy(context.Background(), spec, policy, &adaptiveFakeExecutor{}, AdaptiveRunOptions{MaxConcurrent: 3})
+	report, err := RunAdaptiveStudy(context.Background(), spec, policy, &adaptiveFakeExecutor{}, AdaptiveRunOptions{MaxConcurrent: 3, CandidatesPerRound: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,4 +176,55 @@ func TestRunAdaptiveStudyRecentersSecondL9(t *testing.T) {
 	if report.Best.ObjectiveValues["score"] != 0 {
 		t.Fatalf("best=%#v", report.Best.ObjectiveValues)
 	}
+}
+
+func TestSuccessiveRefinementPolicyRestartsFromState(t *testing.T) {
+	spec := StudySpec{
+		ID: "restartable-study", Method: TaguchiL9,
+		Variables: []Variable{
+			{Name: "x", Levels: []float64{20, 30, 40}},
+			{Name: "y", Levels: []float64{10, 15, 20}},
+		},
+		Workflow: WorkflowTemplate{Build: func(studyID string, candidate Candidate) (emanator.WorkflowSpec, error) {
+			params, err := json.Marshal(candidate.Values)
+			if err != nil {
+				return emanator.WorkflowSpec{}, err
+			}
+			return emanator.WorkflowSpec{ID: studyID + "-" + candidate.ID, Tasks: []emanator.WorkflowTask{{ID: "solve", Tool: "fake", Resources: emanator.ResourceRequest{CPU: 1, RAMMB: 1}, Params: params}}}, nil
+		}},
+		Objectives: []Objective{{Name: "score", TaskID: "solve", Metric: "score", Direction: Minimize}},
+	}
+	firstPolicy, err := NewSuccessiveRefinementPolicy(spec, RefinementPolicyOptions{Rounds: 1, ShrinkFactor: 0.3, ClampToInitialBounds: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := RunAdaptiveStudy(context.Background(), spec, firstPolicy, &adaptiveFakeExecutor{}, AdaptiveRunOptions{MaxConcurrent: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(first.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted StudyState
+	if err := json.Unmarshal(encoded, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	secondPolicy, err := NewSuccessiveRefinementPolicy(spec, RefinementPolicyOptions{Rounds: 2, ShrinkFactor: 0.3, ClampToInitialBounds: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := RunAdaptiveStudy(context.Background(), spec, secondPolicy, &adaptiveFakeExecutor{}, AdaptiveRunOptions{MaxConcurrent: 3, InitialState: persisted, CandidatesPerRound: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State.Round != 2 || len(second.Rounds) != 2 || len(second.Candidates) != 18 {
+		t.Fatalf("unexpected resumed report: round=%d rounds=%d candidates=%d", second.State.Round, len(second.Rounds), len(second.Candidates))
+	}
+	for _, result := range second.Rounds[1].Candidates {
+		if result.Candidate.Values["x"] == 27 && result.Candidate.Values["y"] == 13.5 {
+			return
+		}
+	}
+	t.Fatalf("resumed policy did not reconstruct refined levels: %#v", second.Rounds[1].Candidates)
 }

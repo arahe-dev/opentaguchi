@@ -6,17 +6,18 @@ import (
 	"sort"
 )
 
-// Policy chooses which candidates should be evaluated next. A policy may be
-// completely fixed, as the one-shot DOE policies are, or may use observed
-// results to propose a later round.
+// Policy chooses which candidates should be evaluated next. Implementations
+// must derive their proposal solely from their immutable configuration and the
+// supplied StudyState; a newly constructed policy must produce the same next
+// proposal for the same state.
 type Policy interface {
 	Propose(context.Context, StudyState, int) ([]Candidate, error)
-	Observe(context.Context, []CandidateResult) error
 	Done(StudyState) bool
 }
 
 // StudyState is the serializable, solver-independent state of an adaptive
 // study. Round is the number of completed rounds; a new study starts at zero.
+// Rounds preserves the per-round observations needed by restartable policies.
 type StudyState struct {
 	StudyID      string            `json:"study_id"`
 	Method       Method            `json:"method"`
@@ -25,6 +26,7 @@ type StudyState struct {
 	RoundResults []CandidateResult `json:"round_results,omitempty"`
 	RoundBest    *CandidateResult  `json:"round_best,omitempty"`
 	Best         *CandidateResult  `json:"best,omitempty"`
+	Rounds       []AdaptiveRound   `json:"rounds,omitempty"`
 }
 
 // AdaptiveRound records one policy proposal/execution cycle.
@@ -47,57 +49,45 @@ type AdaptiveStudyReport struct {
 
 // AdaptiveRunOptions controls the execution and stopping envelope around a
 // Policy. A zero MaxRounds means the policy alone controls termination.
+// CandidatesPerRound is an advisory proposal budget; atomic DOE policies
+// intentionally ignore it and emit their complete design.
 type AdaptiveRunOptions struct {
 	MaxConcurrent      int
 	CandidatesPerRound int
 	MaxRounds          int
+	// InitialState resumes a run from a previously persisted StudyState. An
+	// empty state starts a new study.
+	InitialState StudyState
 }
 
-// FixedDOEPolicy is a one-shot DOE policy. If CandidatesPerRound is smaller
-// than the generated design, it emits deterministic chunks until exhausted.
+// FixedDOEPolicy is an atomic one-shot DOE policy. It emits the complete
+// design in one proposal; the CandidatesPerRound budget is intentionally
+// ignored so that an L9 or L27 remains an intact orthogonal array.
 type FixedDOEPolicy struct {
 	Method    Method
 	Variables []Variable
-
-	candidates  []Candidate
-	next        int
-	initialized bool
-	initErr     error
 }
 
 func NewFixedDOEPolicy(method Method, variables []Variable) *FixedDOEPolicy {
 	return &FixedDOEPolicy{Method: method, Variables: cloneVariables(variables)}
 }
 
-func (p *FixedDOEPolicy) Propose(ctx context.Context, _ StudyState, budget int) ([]Candidate, error) {
+func (p *FixedDOEPolicy) Propose(ctx context.Context, state StudyState, _ int) ([]Candidate, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	if !p.initialized {
-		p.candidates, p.initErr = GenerateCandidates(p.Method, p.Variables)
-		p.initialized = true
-	}
-	if p.initErr != nil {
-		return nil, p.initErr
-	}
-	if p.next >= len(p.candidates) {
+	if state.Round > 0 {
 		return nil, nil
 	}
-	count := len(p.candidates) - p.next
-	if budget > 0 && count > budget {
-		count = budget
+	candidates, err := GenerateCandidates(p.Method, p.Variables)
+	if err != nil {
+		return nil, err
 	}
-	proposed := cloneCandidates(p.candidates[p.next : p.next+count])
-	p.next += count
-	return proposed, nil
+	return cloneCandidates(candidates), nil
 }
 
-func (p *FixedDOEPolicy) Observe(ctx context.Context, _ []CandidateResult) error {
-	return contextError(ctx)
-}
-
-func (p *FixedDOEPolicy) Done(_ StudyState) bool {
-	return p.initialized && p.next >= len(p.candidates)
+func (p *FixedDOEPolicy) Done(state StudyState) bool {
+	return state.Round > 0
 }
 
 // TaguchiL9Policy proposes the complete deterministic L9 once.
@@ -130,8 +120,9 @@ type RefinementPolicyOptions struct {
 }
 
 // SuccessiveRefinementPolicy runs repeated three-level Taguchi rounds. After
-// each observed round it recenters and shrinks every variable around that
-// round's best candidate. It is intentionally deterministic and inspectable.
+// each completed round it derives the next levels by recentering and shrinking
+// every variable around that round's best candidate. It is intentionally
+// deterministic, inspectable, and restartable from StudyState.
 type SuccessiveRefinementPolicy struct {
 	Method               Method
 	Initial              []Variable
@@ -140,9 +131,6 @@ type SuccessiveRefinementPolicy struct {
 	ClampToInitialBounds bool
 	Objectives           []Objective
 	Constraints          []Constraint
-
-	current  []Variable
-	observed []CandidateResult
 }
 
 func NewSuccessiveRefinementPolicy(spec StudySpec, options RefinementPolicyOptions) (*SuccessiveRefinementPolicy, error) {
@@ -180,52 +168,61 @@ func NewSuccessiveRefinementPolicy(spec StudySpec, options RefinementPolicyOptio
 	}, nil
 }
 
-func (p *SuccessiveRefinementPolicy) Propose(ctx context.Context, state StudyState, budget int) ([]Candidate, error) {
+func (p *SuccessiveRefinementPolicy) Propose(ctx context.Context, state StudyState, _ int) ([]Candidate, error) {
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
 	if state.Round >= p.Rounds {
 		return nil, nil
 	}
-	if state.Round == 0 {
-		p.current = cloneVariables(p.Initial)
-	} else {
-		best := state.RoundBest
-		if best == nil && len(p.observed) > 0 {
-			best = bestResult(p.observed, p.Objectives)
-		}
-		if best == nil {
-			return nil, fmt.Errorf("refinement round %d has no observed best candidate", state.Round)
-		}
-		var err error
-		p.current, err = refineVariables(p.current, p.Initial, best.Candidate.Values, p.ShrinkFactor, p.ClampToInitialBounds)
-		if err != nil {
-			return nil, err
-		}
+	current, err := p.variablesForNextRound(state)
+	if err != nil {
+		return nil, err
 	}
-	candidates, err := GenerateCandidates(p.Method, p.current)
+	candidates, err := GenerateCandidates(p.Method, current)
 	if err != nil {
 		return nil, err
 	}
 	for index := range candidates {
 		candidates[index].ID = fmt.Sprintf("round-%02d-%s", state.Round+1, candidates[index].ID)
 	}
-	if budget > 0 && budget < len(candidates) {
-		candidates = candidates[:budget]
-	}
 	return cloneCandidates(candidates), nil
 }
 
-func (p *SuccessiveRefinementPolicy) Observe(ctx context.Context, results []CandidateResult) error {
-	if err := contextError(ctx); err != nil {
-		return err
+func (p *SuccessiveRefinementPolicy) variablesForNextRound(state StudyState) ([]Variable, error) {
+	current := cloneVariables(p.Initial)
+	for completedRound := 1; completedRound <= state.Round; completedRound++ {
+		best := state.bestForRound(completedRound, p.Objectives)
+		if best == nil {
+			return nil, fmt.Errorf("refinement round %d has no observed best candidate in StudyState", completedRound)
+		}
+		var err error
+		current, err = refineVariables(current, p.Initial, best.Candidate.Values, p.ShrinkFactor, p.ClampToInitialBounds)
+		if err != nil {
+			return nil, err
+		}
 	}
-	p.observed = cloneCandidateResults(results)
-	return nil
+	return current, nil
 }
 
 func (p *SuccessiveRefinementPolicy) Done(state StudyState) bool {
 	return state.Round >= p.Rounds
+}
+
+func (state StudyState) bestForRound(number int, objectives []Objective) *CandidateResult {
+	for _, round := range state.Rounds {
+		if round.Number == number {
+			return bestResult(round.Candidates, objectives)
+		}
+	}
+	if number == state.Round {
+		if state.RoundBest != nil {
+			best := *state.RoundBest
+			return &best
+		}
+		return bestResult(state.RoundResults, objectives)
+	}
+	return nil
 }
 
 func validateRefinementVariables(variables []Variable) error {
@@ -321,6 +318,33 @@ func cloneCandidateResults(results []CandidateResult) []CandidateResult {
 		cloned[index].Violations = append([]string(nil), result.Violations...)
 		cloned[index].Metrics = cloneFloatMap(result.Metrics)
 		cloned[index].ObjectiveValues = cloneFloatMap(result.ObjectiveValues)
+	}
+	return cloned
+}
+
+func cloneAdaptiveRounds(rounds []AdaptiveRound) []AdaptiveRound {
+	cloned := make([]AdaptiveRound, len(rounds))
+	for index, round := range rounds {
+		cloned[index] = AdaptiveRound{
+			Number:     round.Number,
+			Candidates: cloneCandidateResults(round.Candidates),
+		}
+	}
+	return cloned
+}
+
+func cloneStudyState(state StudyState) StudyState {
+	cloned := state
+	cloned.Results = cloneCandidateResults(state.Results)
+	cloned.RoundResults = cloneCandidateResults(state.RoundResults)
+	cloned.Rounds = cloneAdaptiveRounds(state.Rounds)
+	if state.RoundBest != nil {
+		best := cloneCandidateResults([]CandidateResult{*state.RoundBest})[0]
+		cloned.RoundBest = &best
+	}
+	if state.Best != nil {
+		best := cloneCandidateResults([]CandidateResult{*state.Best})[0]
+		cloned.Best = &best
 	}
 	return cloned
 }
