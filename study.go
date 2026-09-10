@@ -3,7 +3,6 @@ package opentaguchi
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
@@ -175,21 +174,20 @@ func validName(value string) bool {
 }
 
 func RunStudy(ctx context.Context, spec StudySpec, executor WorkflowExecutor, options RunOptions) (StudyReport, error) {
-	report := StudyReport{StudyID: spec.ID, Method: spec.Method}
-	if err := spec.Validate(); err != nil {
-		return report, err
+	adaptive, err := RunAdaptiveStudy(ctx, spec, NewFixedDOEPolicy(spec.Method, spec.Variables), executor, AdaptiveRunOptions{MaxConcurrent: options.MaxConcurrent})
+	return StudyReport{
+		StudyID:    adaptive.StudyID,
+		Method:     adaptive.Method,
+		Candidates: adaptive.Candidates,
+		Best:       adaptive.Best,
+	}, err
+}
+
+func executeCandidates(ctx context.Context, spec StudySpec, candidates []Candidate, executor WorkflowExecutor, maxConcurrent int) []CandidateResult {
+	if len(candidates) == 0 {
+		return nil
 	}
-	if executor == nil {
-		return report, fmt.Errorf("workflow executor is required")
-	}
-	candidates, err := GenerateCandidates(spec.Method, spec.Variables)
-	if err != nil {
-		return report, err
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	limit := options.MaxConcurrent
+	limit := maxConcurrent
 	if limit <= 0 || limit > len(candidates) {
 		limit = len(candidates)
 	}
@@ -208,31 +206,16 @@ func RunStudy(ctx context.Context, spec StudySpec, executor WorkflowExecutor, op
 				return
 			}
 			defer func() { <-semaphore }()
-			result := runCandidate(ctx, spec, candidate, executor)
-			results <- result
+			results <- runCandidate(ctx, spec, candidate, executor)
 		}()
 	}
 	waitGroup.Wait()
 	close(results)
+	collected := make([]CandidateResult, 0, len(candidates))
 	for result := range results {
-		report.Candidates = append(report.Candidates, result)
+		collected = append(collected, result)
 	}
-	sort.SliceStable(report.Candidates, func(i, j int) bool {
-		return better(report.Candidates[i], report.Candidates[j], spec.Objectives)
-	})
-	for index := range report.Candidates {
-		report.Candidates[index].Rank = index + 1
-	}
-	for index := range report.Candidates {
-		if report.Candidates[index].Feasible && report.Candidates[index].Error == "" {
-			report.Best = &report.Candidates[index]
-			break
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return report, err
-	}
-	return report, nil
+	return collected
 }
 
 func runCandidate(ctx context.Context, spec StudySpec, candidate Candidate, executor WorkflowExecutor) CandidateResult {

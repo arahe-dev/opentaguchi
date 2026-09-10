@@ -39,3 +39,19 @@ An `emanator.CoordinatorClient` directly implements `WorkflowExecutor`.
 case: nine L9 CFD workflows on three Emanator workers, maximizing lift-to-drag
 subject to a lift constraint. See [`examples/su2`](examples/su2) for the
 official solver download and run instructions.
+
+## Adaptive policy proof
+
+`cmd/arm-adaptive-study` runs the same arm workflow through two deterministic
+L9 rounds. Round one evaluates the broad levels, then the policy recenters and
+shrinks all four levels around the best feasible result before proposing round
+two. The policy/state loop is generic; the arm workflow remains an ordinary
+Emanator workflow builder.
+
+```text
+go run ./cmd/arm-adaptive-study -coordinator-url http://127.0.0.1:8080
+```
+
+The public `Policy` boundary also includes `TaguchiL9Policy`,
+`TaguchiL27Policy`, and `FullFactorialPolicy`; these are one-shot policies that
+propose their complete design once.

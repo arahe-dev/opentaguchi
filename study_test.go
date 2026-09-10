@@ -2,6 +2,8 @@ package opentaguchi
 
 import (
 	"context"
+	"encoding/json"
+	"sync"
 	"testing"
 
 	"github.com/arahe-dev/emanator"
@@ -75,5 +77,101 @@ func TestRunStudyRanksFeasibleCandidates(t *testing.T) {
 	report, err := RunStudy(context.Background(), spec, executor, RunOptions{})
 	if err != nil || len(report.Candidates) != 2 || report.Best == nil || report.Candidates[0].Rank != 1 {
 		t.Fatalf("report=%#v err=%v", report, err)
+	}
+}
+
+func TestTaguchiPoliciesProposeFixedDesigns(t *testing.T) {
+	variables := []Variable{{Name: "x", Levels: []float64{1, 2, 3}}, {Name: "y", Levels: []float64{4, 5, 6}}}
+	policy := NewTaguchiL9Policy(variables)
+	candidates, err := policy.Propose(context.Background(), StudyState{}, 0)
+	if err != nil || len(candidates) != 9 {
+		t.Fatalf("candidates=%d err=%v", len(candidates), err)
+	}
+	if err := policy.Observe(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !policy.Done(StudyState{}) || candidates[0].ID != "candidate-01" {
+		t.Fatalf("unexpected fixed policy state: done=%t first=%q", policy.Done(StudyState{}), candidates[0].ID)
+	}
+}
+
+type adaptiveFakeExecutor struct {
+	mu     sync.Mutex
+	states map[string]emanator.WorkflowState
+}
+
+func (e *adaptiveFakeExecutor) StartWorkflow(_ context.Context, spec emanator.WorkflowSpec) (emanator.WorkflowState, error) {
+	values := make(map[string]float64)
+	if err := json.Unmarshal(spec.Tasks[0].Params, &values); err != nil {
+		return emanator.WorkflowState{}, err
+	}
+	score := (values["x"]-30)*(values["x"]-30) + (values["y"]-15)*(values["y"]-15)
+	state := emanator.WorkflowState{
+		ID:     spec.ID,
+		Spec:   spec,
+		Status: emanator.WorkflowSucceeded,
+		Tasks:  []emanator.WorkflowTaskStatus{{ID: "solve", State: emanator.WorkflowTaskSucceeded, Result: &emanator.JobResult{Status: emanator.JobSucceeded, Metrics: map[string]float64{"score": score}}}},
+	}
+	e.mu.Lock()
+	if e.states == nil {
+		e.states = make(map[string]emanator.WorkflowState)
+	}
+	e.states[spec.ID] = state
+	e.mu.Unlock()
+	return state, nil
+}
+
+func (e *adaptiveFakeExecutor) WaitWorkflow(_ context.Context, id string) (emanator.WorkflowState, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.states[id], nil
+}
+
+func TestRunAdaptiveStudyRecentersSecondL9(t *testing.T) {
+	spec := StudySpec{
+		ID: "adaptive-arm", Method: TaguchiL9,
+		Variables: []Variable{
+			{Name: "x", Levels: []float64{20, 30, 40}},
+			{Name: "y", Levels: []float64{10, 15, 20}},
+		},
+		Workflow: WorkflowTemplate{Build: func(studyID string, candidate Candidate) (emanator.WorkflowSpec, error) {
+			params, err := json.Marshal(candidate.Values)
+			if err != nil {
+				return emanator.WorkflowSpec{}, err
+			}
+			return emanator.WorkflowSpec{ID: studyID + "-" + candidate.ID, Tasks: []emanator.WorkflowTask{{ID: "solve", Tool: "fake", Resources: emanator.ResourceRequest{CPU: 1, RAMMB: 1}, Params: params}}}, nil
+		}},
+		Objectives: []Objective{{Name: "score", TaskID: "solve", Metric: "score", Direction: Minimize}},
+	}
+	policy, err := NewSuccessiveRefinementPolicy(spec, RefinementPolicyOptions{Rounds: 2, ShrinkFactor: 0.3, ClampToInitialBounds: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := RunAdaptiveStudy(context.Background(), spec, policy, &adaptiveFakeExecutor{}, AdaptiveRunOptions{MaxConcurrent: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Rounds) != 2 || len(report.Candidates) != 18 || report.State.Round != 2 || report.Best == nil {
+		t.Fatalf("unexpected adaptive report: rounds=%d candidates=%d state=%d best=%#v", len(report.Rounds), len(report.Candidates), report.State.Round, report.Best)
+	}
+	secondRoundIDs := make(map[string]struct{}, len(report.Rounds[1].Candidates))
+	for _, result := range report.Rounds[1].Candidates {
+		secondRoundIDs[result.Candidate.ID] = struct{}{}
+	}
+	if _, ok := secondRoundIDs["round-02-candidate-01"]; !ok {
+		t.Fatalf("second round ids=%v", secondRoundIDs)
+	}
+	foundRefinedLevel := false
+	for _, result := range report.Rounds[1].Candidates {
+		if result.Candidate.Values["x"] == 27 && result.Candidate.Values["y"] == 13.5 {
+			foundRefinedLevel = true
+			break
+		}
+	}
+	if !foundRefinedLevel {
+		t.Fatalf("second round did not use recentered levels: %#v", report.Rounds[1].Candidates)
+	}
+	if report.Best.ObjectiveValues["score"] != 0 {
+		t.Fatalf("best=%#v", report.Best.ObjectiveValues)
 	}
 }
